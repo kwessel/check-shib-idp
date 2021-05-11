@@ -14,7 +14,12 @@ Changelog:
 
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
-import argparse, requests, base64, sys, binascii, time
+import argparse
+import requests
+import base64
+import sys
+import binascii
+import time
 
 # For writing debug output
 from http.client import HTTPConnection
@@ -77,7 +82,7 @@ def do_idp_initiated(host, sp, user, password, attribute):
         if debug:
             print("Sending initial request to IdP")
         resp = sess.get("https://{}/idp/profile/SAML2/Unsolicited/SSO".format(host),
-            params=req_params, timeout=timeout)
+                        params=req_params, timeout=timeout)
         if resp.status_code != 200:
             debug and print_response_body(resp.text)
             raise IdPException("Not redirected to login page - HTTP status {}".format(resp.status_code))
@@ -129,14 +134,14 @@ def do_idp_initiated(host, sp, user, password, attribute):
     elif debug:
         print("Required attribute {} found in response".format(attribute))
 
-def do_sp_initiated(url, user, password, str, idp):
+def do_sp_initiated(url, user, password, string, idp):
     """do_sp_initiated() -- Check an SP resource that's Shibboleth-protected
 
     Params:
     url -- URL of the protected page to check
     user -- username to use in authentication
     password -- password to use in authentication
-    str -- text that must be present on the page after return from IdP
+    string -- text that must be present on the page after return from IdP
     idp -- optional entity ID of the IdP to choose if directed to a discovery page
 
     Throws:
@@ -193,7 +198,7 @@ def do_sp_initiated(url, user, password, str, idp):
     form_data = {}
     for input_tag in saml_form.find_all("input"):
         input_name = input_tag.attrs.get("name")
-        input_value =input_tag.attrs.get("value", "")
+        input_value = input_tag.attrs.get("value", "")
         form_data[input_name] = input_value
 
     if not action or not form_data:
@@ -213,12 +218,12 @@ def do_sp_initiated(url, user, password, str, idp):
 
     debug and print_response_body(resp.text)
 
-    if str not in resp.text:
+    if string not in resp.text:
         raise SPException("Expected output text not found after authentication")
     elif debug:
         print("Expected output text found after authentication")
 
-def do_discovery_select(sess,resp,idp):
+def do_discovery_select(sess, resp, idp):
     """do_discovery_select() -- Select an IdP from a discovery service
 
     Params:
@@ -261,8 +266,8 @@ def do_discovery_select(sess,resp,idp):
         if debug:
             print("Selecting IdP from discovery page")
 
-        resp = sess.post("https://{}{}".format(host,action), data=disco_data,
-            timeout=timeout)
+        resp = sess.post("https://{}{}".format(host, action), data=disco_data,
+                         timeout=timeout)
         if resp.status_code != 200:
             debug and print_response_body(resp.text)
 
@@ -274,7 +279,7 @@ def do_discovery_select(sess,resp,idp):
 
     return resp
 
-def do_login(sess,resp,user,password):
+def do_login(sess, resp, user, password):
     """do_login() -- authenticate to an IdP
 
     Params:
@@ -319,8 +324,8 @@ def do_login(sess,resp,user,password):
         if debug:
             print("Submitting IdP login form")
 
-        resp = sess.post("https://{}{}".format(host,action), data=login_data,
-            timeout=timeout)
+        resp = sess.post("https://{}{}".format(host, action), data=login_data,
+                         timeout=timeout)
 
         if resp.status_code != 200:
             debug and print_response_body(resp.text)
@@ -348,65 +353,65 @@ if __name__ == "__main__":
     req_opts = parser.add_argument_group("Required options")
     idp_opts = parser.add_argument_group("IdP monitoring options")
     sp_opts = parser.add_argument_group("SP monitoring options")
-    
+
     #-d / --debug
     parser.add_argument("-d", "--debug", dest="debug", default=False,
-        action="store_true", help="enable debugging outputs")
-    
+                        action="store_true", help="enable debugging outputs")
+
     #-w / --warn
     parser.add_argument("-w", "--warn", metavar="ms", dest="warn", type=float,
-        action="store",
-        help="warning when IDP processing time exceeds this time in milliseconds")
+                        action="store",
+                        help="warning when IDP processing time exceeds this time in milliseconds")
 
     #-c / --crit
     parser.add_argument("-c", "--crit", metavar="ms", dest="crit", type=float,
-        action="store",
-        help="critical when IDP processing time exceeds this time in milliseconds")
+                        action="store",
+                        help="critical when IDP processing time exceeds this time in milliseconds")
 
     #-t / --timeout
     parser.add_argument("-t", "--timeout", metavar="secs", dest="timeout",
-        type=float, default=15, action="store",
-        help="HTTP request timeout in seconds")
+                        type=float, default=15, action="store",
+                        help="HTTP request timeout in seconds")
 
     #-U / --user
     req_opts.add_argument("-U", "--user", required=True, metavar="username",
-        dest="user", action="store",
-        help="User to authenticate as")
+                          dest="user", action="store",
+                          help="User to authenticate as")
 
     #-P / --password
     req_opts.add_argument("-P", "--password", required=True, metavar="password",
-        dest="password", action="store",
-        help="Password for authentication user")
+                          dest="password", action="store",
+                          help="Password for authentication user")
 
     #-H / --host
     idp_opts.add_argument("-H", "--host", metavar="hostname", dest="host",
-    action="store", help="IdP hostname when checking an IdP directly")
+                          action="store", help="IdP hostname when checking an IdP directly")
 
     #-e / --entitty-id
     idp_opts.add_argument("-e", "--entity-id", metavar="entityID",
-        dest="entityid", action="store",
-        default="urn:mace:incommon:uiuc.edu:healthcheck:nagios",
-        help="Entity ID to use in authn request")
+                          dest="entityid", action="store",
+                          default="urn:mace:incommon:uiuc.edu:healthcheck:nagios",
+                          help="Entity ID to use in authn request")
 
     #-a / --attribute
     idp_opts.add_argument("-a", "--attribute", metavar="attribute",
-        dest="attribute", action="store", default="eduPersonPrincipalName",
-        help="Friendly name of SAML attribute that must be in a successful response")
+                          dest="attribute", action="store", default="eduPersonPrincipalName",
+                          help="Friendly name of SAML attribute that must be in a successful response")
 
     #-u / --url
     sp_opts.add_argument("-u", "--url", metavar="URL", dest="url",
-        action="store",
-        help="URL of Shibboleth-protected resource when checking an SP")
+                         action="store",
+                         help="URL of Shibboleth-protected resource when checking an SP")
 
     #-s / --output-string
     sp_opts.add_argument("-s", "--output-string", metavar="string",
-        dest="outputStr", action="store",
-        help="Text to expect on final page after successful authentication")
+                         dest="outputStr", action="store",
+                         help="Text to expect on final page after successful authentication")
 
     #-i / --idp-selection
     sp_opts.add_argument("-i", "--idp-selection", metavar="entityID",
-        dest="idp", action="store", default="urn:mace:incommon:uiuc.edu",
-        help="Entity of the IdP to choose if the service redirects to a discovery page")
+                         dest="idp", action="store", default="urn:mace:incommon:uiuc.edu",
+                         help="Entity of the IdP to choose if the service redirects to a discovery page")
 
     #parse arguments
     options = parser.parse_args()
@@ -419,9 +424,8 @@ if __name__ == "__main__":
         print()
 
         HTTPConnection.debuglevel = 1
-        requests.logging.basicConfig(stream=sys.stdout,
-            level=requests.logging.DEBUG)
-        requests_log = requests.logging.getLogger("urllib3")
+        requests.logging.basicConfig(stream=sys.stdout, level=requests.logging.DEBUG)
+        requests_log = requests.logging.getLogger("check_shib_idp")
         requests_log.propagate = True
 
     timeout = options.timeout
@@ -445,26 +449,26 @@ if __name__ == "__main__":
                 print("Doing IdP-initiated check")
 
             do_idp_initiated(options.host, options.entityid,
-                options.user, options.password, options.attribute)
+                             options.user, options.password, options.attribute)
         elif options.url:
             if debug:
                 print("Doing SP-initiated check")
 
             do_sp_initiated(options.url, options.user, options.password,
-                options.outputStr, options.idp)
-    except (SPException,IdPException) as e:
+                            options.outputStr, options.idp)
+    except (SPException, IdPException) as e:
         runtime = round((time.clock() - start_time) * 1000)
-        print("IDP CRITICAL - {};|TIME={}\n".format(e,runtime))
+        print("IDP CRITICAL - {};|TIME={}\n".format(e, runtime))
         sys.exit(2)
 
     runtime = round((time.clock() - start_time) * 1000)
 
     if options.crit and runtime > options.crit:
-        print("IDP CRITICAL - TIME={} MS;|TIME={}\n".format(runtime,runtime))
+        print("IDP CRITICAL - TIME={} MS;|TIME={}\n".format(runtime, runtime))
         sys.exit(2)
     elif options.warn and runtime > options.warn:
-        print("IDP WARN - TIME={} MS;|TIME={}\n".format(runtime,runtime))
+        print("IDP WARN - TIME={} MS;|TIME={}\n".format(runtime, runtime))
         sys.exit(1)
     else:
-        print("IDP OK - TIME={} MS;|TIME={}\n".format(runtime,runtime))
+        print("IDP OK - TIME={} MS;|TIME={}\n".format(runtime, runtime))
         sys.exit(0)
