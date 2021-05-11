@@ -30,8 +30,27 @@ class IdPException(Exception):
 class SPException(Exception):
     pass
 
-def doIdPInitiated(host, sp, user, password, attribute):
-    """doIdPInitiated() -- check in IdP directly
+def print_response_body(text):
+    """print_response_body() -- print response body on error when in debug mode
+
+    Params:
+    text -- resp.text from request object
+
+    Throws:
+    None
+
+    Returns:
+    None
+    """
+
+    print()
+    print("BEGIN RESPONSE BODY:")
+    print(text)
+    print("END RESPONSE BODY:")
+    print()
+
+def do_idp_initiated(host, sp, user, password, attribute):
+    """do_idp_initiated() -- check in IdP directly
 
     Params:
     host -- IdP hostname
@@ -48,7 +67,7 @@ def doIdPInitiated(host, sp, user, password, attribute):
     """
 
     # Set SP to use for authn request
-    reqParams = {"providerId": sp}
+    req_params = {"providerId": sp}
 
     # Create persistent session
     sess = requests.session()
@@ -58,65 +77,60 @@ def doIdPInitiated(host, sp, user, password, attribute):
         if debug:
             print("Sending initial request to IdP")
         resp = sess.get("https://{}/idp/profile/SAML2/Unsolicited/SSO".format(host),
-            params=reqParams, timeout=timeout)
+            params=req_params, timeout=timeout)
         if resp.status_code != 200:
-            if debug:
-                print()
-                print("BEGIN RESPONSE BODY:")
-                print(resp.text)
-                print("END RESPONSE BODY:")
-                print()
-
+            debug and print_response_body(resp.text)
             raise IdPException("Not redirected to login page - HTTP status {}".format(resp.status_code))
     except requests.exceptions.RequestException as e:
         raise IdPException("Not redirected to login page - {}".format(e))
 
-    if debug:
-        print()
-        print("BEGIN RESPONSE BODY:")
-        print(resp.text)
-        print("END RESPONSE BODY:")
-        print()
+    debug and print_response_body(resp.text)
 
-    resp = doLogin(sess, resp, user, password)
+    resp = do_login(sess, resp, user, password)
 
     # Parse SAML response out of form
-    try:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        samlResp = soup.form.find("input", {"name": "SAMLResponse"}).get("value")
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    except AttributeError:
+    saml_form = None
+    for form in soup.find_all("form"):
+        if form.find("input", {"name": "SAMLResponse"}):
+            saml_form = form
+            break
+
+    if not saml_form:
         raise IdPException("Invalid response from IdP after authentication")
+
+    saml_resp = saml_form.find("input", {"name": "SAMLResponse"}).get("value")
 
     if debug:
         print("Base64-encoded SAML response")
-        print(samlResp)
+        print(saml_resp)
         print()
 
     # Base64 decode response
     try:
-        decodedResp = base64.b64decode(samlResp).decode()
+        decoded_resp = base64.b64decode(saml_resp).decode()
 
     except binascii.Error:
         raise IdPException("Unable to base64 decode response from IdP")
 
     if debug:
         print("Base64-decoded SAML response")
-        print(decodedResp)
+        print(decoded_resp)
         print()
 
-    if "urn:oasis:names:tc:SAML:2.0:status:Success" not in decodedResp:
+    if "urn:oasis:names:tc:SAML:2.0:status:Success" not in decoded_resp:
         raise IdPException("SAML success status not found in response")
     elif debug:
         print("SAML success status found in response")
 
-    if 'FriendlyName="{}"'.format(attribute) not in decodedResp:
+    if 'FriendlyName="{}"'.format(attribute) not in decoded_resp:
         raise IdPException("Required attribute {} not found in response".format(attribute))
     elif debug:
         print("Required attribute {} found in response".format(attribute))
 
-def doSPInitiated(url, user, password, str, idp):
-    """doSPInitiated() -- Check an SP resource that's Shibboleth-protected
+def do_sp_initiated(url, user, password, str, idp):
+    """do_sp_initiated() -- Check an SP resource that's Shibboleth-protected
 
     Params:
     url -- URL of the protected page to check
@@ -142,79 +156,70 @@ def doSPInitiated(url, user, password, str, idp):
             print("Sending initial request to SP")
         resp = sess.get(url, timeout=timeout)
         if resp.status_code != 200:
-            if debug:
-                print()
-                print("BEGIN RESPONSE BODY:")
-                print(resp.text)
-                print("END RESPONSE BODY:")
-                print()
-
+            debug and print_response_body(resp.text)
             raise SPException("Not redirected to login page - HTTP status {}".format(resp.status_code))
     except requests.exceptions.RequestException as e:
         raise SPException("Not redirected to login page - {}".format(e))
 
-    if debug:
-        print()
-        print("BEGIN RESPONSE BODY:")
-        print(resp.text)
-        print("END RESPONSE BODY:")
-        print()
+    debug and print_response_body(resp.text)
 
     # Were we redirected to the campus selection page?
     soup = BeautifulSoup(resp.text, "html.parser")
-    if soup.title.string == "Illinois Identity Provider Selection":
-        if debug:
-            print("IdP discovery page detected")
 
-        resp = doDiscoverySelect(sess, resp, idp)
+    for form in soup.find_all("form"):
+        if form.get("name") == "IdPList":
+            if debug:
+                print("IdP discovery page detected")
 
-    resp = doLogin(sess, resp, user, password)
+            resp = do_discovery_select(sess, resp, idp)
+            break
+
+    resp = do_login(sess, resp, user, password)
 
     # Get form to submit back to SP
     soup = BeautifulSoup(resp.text, "html.parser")
-    action = soup.form.get("action")
 
-    formData = {}
-    for input_tag in soup.form.find_all("input"):
+    saml_form = None
+    for form in soup.find_all("form"):
+        if form.find("input", {"name": "SAMLResponse"}):
+            saml_form = form
+            break
+
+    if not saml_form:
+        raise IdPException("Invalid response from IdP after authentication")
+
+    action = saml_form.get("action")
+
+    form_data = {}
+    for input_tag in saml_form.find_all("input"):
         input_name = input_tag.attrs.get("name")
         input_value =input_tag.attrs.get("value", "")
-        formData[input_name] = input_value
+        form_data[input_name] = input_value
 
-    if not action or not formData:
+    if not action or not form_data:
         raise SPException("Invalid response from IdP after authentication")
 
     try:
         if debug:
             print("Submitting IdP response back to SP")
 
-        resp = sess.post(action, data=formData, timeout=timeout)
+        resp = sess.post(action, data=form_data, timeout=timeout)
 
         if resp.status_code != 200:
-            if debug:
-                print()
-                print("BEGIN RESPONSE BODY:")
-                print(resp.text)
-                print("END RESPONSE BODY:")
-                print()
-
+            debug and print_response_body(resp.text)
             raise SPException("Failed to return to SP after authentication - HTTP status {}".format(resp.status_code))
     except requests.exceptions.RequestException as e:
         raise SPException("Failed to return to SP after authentication - {}".format(e))
 
-    if debug:
-        print()
-        print("BEGIN RESPONSE BODY:")
-        print(resp.text)
-        print("END RESPONSE BODY:")
-        print()
+    debug and print_response_body(resp.text)
 
-    if resp.text.find(str) == -1:
+    if str not in resp.text:
         raise SPException("Expected output text not found after authentication")
     elif debug:
         print("Expected output text found after authentication")
 
-def doDiscoverySelect(sess,resp,idp):
-    """doDiscoverySelect() -- Select an IdP from a discovery service
+def do_discovery_select(sess,resp,idp):
+    """do_discovery_select() -- Select an IdP from a discovery service
 
     Params:
     sess -- persistent request.session object
@@ -230,48 +235,47 @@ def doDiscoverySelect(sess,resp,idp):
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Get IdP hostname from response
+    disco_form = None
+    for form in soup.find_all("form"):
+        if form.get("name") == "IdPList":
+            disco_form = form
+            break
+
+    if not disco_form:
+        raise IdPException("Unable to find form on IdP discovery page")
+
+    # Get discovery service hostname from response
     host = urlparse(resp.url).netloc
 
     # Get form response URL to submit back to discovery service
-    action = soup.form.get("action")
+    action = disco_form.get("action")
 
     if not host or not action:
         raise SPException("Error from discovery service")
 
     # Build form response
-    discoData = {"user_idp": idp, "Select": "Select"}
+    disco_data = {"user_idp": idp, "Select": "Select"}
 
     # Select campus
     try:
         if debug:
             print("Selecting IdP from discovery page")
 
-        resp = sess.post("https://{}{}".format(host,action), data=discoData,
+        resp = sess.post("https://{}{}".format(host,action), data=disco_data,
             timeout=timeout)
         if resp.status_code != 200:
-            if debug:
-                print()
-                print("BEGIN RESPONSE BODY:")
-                print(resp.text)
-                print("END RESPONSE BODY:")
-                print()
+            debug and print_response_body(resp.text)
 
             raise SPException("Failed to return to SP after IdP selection - HTTP status {}".format(resp.status_code))
     except requests.exceptions.RequestException as e:
         raise SPException("Failed to return to SP after IdP selection - {}".format(e))
 
-    if debug:
-        print()
-        print("BEGIN RESPONSE BODY:")
-        print(resp.text)
-        print("END RESPONSE BODY:")
-        print()
+    debug and print_response_body(resp.text)
 
     return resp
 
-def doLogin(sess,resp,user,password):
-    """doLogin() -- authenticate to an IdP
+def do_login(sess,resp,user,password):
+    """do_login() -- authenticate to an IdP
 
     Params:
     sess -- persistent request.session object
@@ -287,14 +291,25 @@ def doLogin(sess,resp,user,password):
     """
 
     # IdP login form data to use for authentication
-    loginData = {'_eventId_proceed': 'Login', 'j_username': user, 'j_password': password}
+    login_data = {'_eventId_proceed': 'Login', 'j_username': user, 'j_password': password}
 
     # Get IdP hostname from response
     host = urlparse(resp.url).netloc
 
-    # Get form response URL
+    # Make sure page contains a login form
     soup = BeautifulSoup(resp.text, "html.parser")
-    action = soup.form.get("action")
+
+    login_form = None
+    for form in soup.find_all("form"):
+        if form.find("input", {"name": "j_username"}):
+            login_form = form
+            break
+
+    if not login_form:
+        raise IdPException("Error displaying IdP login page")
+
+    # Get form response URL
+    action = login_form.get("action")
 
     if not host or not action:
         raise IdPException("Error displaying IdP login page")
@@ -304,39 +319,23 @@ def doLogin(sess,resp,user,password):
         if debug:
             print("Submitting IdP login form")
 
-        resp = sess.post("https://{}{}".format(host,action), data=loginData,
+        resp = sess.post("https://{}{}".format(host,action), data=login_data,
             timeout=timeout)
 
         if resp.status_code != 200:
-            if debug:
-                print()
-                print("BEGIN RESPONSE BODY:")
-                print(resp.text)
-                print("END RESPONSE BODY:")
-                print()
-
+            debug and print_response_body(resp.text)
             raise IdPException("Failed to submit login page to IdP - HTTP status {}".format(resp.status_code))
     except requests.exceptions.RequestException as e:
         raise IdPException("Failed to submit login page to IdP - {}".format(e))
 
-    if debug:
-        print()
-        print("BEGIN RESPONSE BODY:")
-        print(resp.text)
-        print("END RESPONSE BODY:")
-        print()
+    debug and print_response_body(resp.text)
 
     # Make sure we didn't get the login form again
     soup = BeautifulSoup(resp.text, "html.parser")
-    if soup.form.find("input", {"name": "j_username"}):
-        raise IdPException("IdP authentication failed")
 
-    if debug:
-        print()
-        print("BEGIN RESPONSE BODY:")
-        print(resp.text)
-        print("END RESPONSE BODY:")
-        print()
+    for form in soup.find_all("form"):
+        if form.find("input", {"name": "j_username"}):
+            raise IdPException("IdP authentication failed")
 
     return resp
 
@@ -439,33 +438,33 @@ if __name__ == "__main__":
     if options.url and not (urlparse(options.url).scheme and urlparse(options.url).netloc):
         parser.error("SP URL must be a valid URL")
 
-    startTime = time.clock()
+    start_time = time.clock()
     try:
         if options.host:
             if debug:
                 print("Doing IdP-initiated check")
 
-            doIdPInitiated(options.host, options.entityid,
+            do_idp_initiated(options.host, options.entityid,
                 options.user, options.password, options.attribute)
         elif options.url:
             if debug:
                 print("Doing SP-initiated check")
 
-            doSPInitiated(options.url, options.user, options.password,
+            do_sp_initiated(options.url, options.user, options.password,
                 options.outputStr, options.idp)
     except (SPException,IdPException) as e:
-        runTime = round((time.clock() - startTime) * 1000)
-        print("IDP CRITICAL - {};|TIME={}\n".format(e,runTime))
+        runtime = round((time.clock() - start_time) * 1000)
+        print("IDP CRITICAL - {};|TIME={}\n".format(e,runtime))
         sys.exit(2)
 
-    runTime = round((time.clock() - startTime) * 1000)
+    runtime = round((time.clock() - start_time) * 1000)
 
-    if options.crit and runTime > options.crit:
-        print("IDP CRITICAL - TIME={} MS;|TIME={}\n".format(runTime,runTime))
+    if options.crit and runtime > options.crit:
+        print("IDP CRITICAL - TIME={} MS;|TIME={}\n".format(runtime,runtime))
         sys.exit(2)
-    elif options.warn and runTime > options.warn:
-        print("IDP WARN - TIME={} MS;|TIME={}\n".format(runTime,runTime))
+    elif options.warn and runtime > options.warn:
+        print("IDP WARN - TIME={} MS;|TIME={}\n".format(runtime,runtime))
         sys.exit(1)
     else:
-        print("IDP OK - TIME={} MS;|TIME={}\n".format(runTime,runTime))
+        print("IDP OK - TIME={} MS;|TIME={}\n".format(runtime,runtime))
         sys.exit(0)
