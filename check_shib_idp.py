@@ -55,7 +55,7 @@ def print_response_body(text):
     print()
 
 def do_idp_initiated(host, sp, user, password, attribute):
-    """do_idp_initiated() -- check in IdP directly
+    """do_idp_initiated() -- check an IdP directly
 
     Params:
     host -- IdP hostname
@@ -223,6 +223,136 @@ def do_sp_initiated(url, user, password, string, idp):
     elif debug:
         print("Expected output text found after authentication")
 
+def do_proxy_idp_initiated(host, sp, user, password, attribute, idp):
+    """do_proxy_idp_initiated() -- check a proxy IdP directly
+
+    Params:
+    host -- IdP hostname
+    sp -- entity ID of the SP to identify ourselves as
+    user -- username to use in authentication
+    password: password to use in authentication
+    attribute -- SAML2 name of SAML attribute that must be in response
+    idp -- optional entity ID of the IdP to choose if directed to a discovery page
+
+    Throws:
+    SPException if interaction fails with the embedded SP or discovery service
+    IdPException if interaction fails with the real or proxy IdP
+
+    Returns:
+    None
+    """
+
+    # Set SP to use for authn request
+    req_params = {"spentityid": sp}
+
+    # Create persistent session
+    sess = requests.session()
+
+    # Send initial IdP-initiated SSO request
+    try:
+        if debug:
+            print("Sending initial request to proxy IdP")
+        resp = sess.get("https://{}/simplesaml/saml2/idp/SSOService.php".format(host),
+                        params=req_params, timeout=timeout)
+        if resp.status_code != 200:
+            debug and print_response_body(resp.text)
+            raise IdPException("Not redirected to proxy IdP - HTTP status {}".format(resp.status_code))
+    except requests.exceptions.RequestException as e:
+        raise IdPException("Not redirected to proxy IdP - {}".format(e))
+
+    debug and print_response_body(resp.text)
+
+    # Were we redirected to the campus selection page?
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    for form in soup.find_all("form"):
+        if form.get("name") == "IdPList":
+            if debug:
+                print("IdP discovery page detected")
+
+            resp = do_discovery_select(sess, resp, idp)
+            break
+
+    resp = do_login(sess, resp, user, password)
+
+    # Get form to submit back to embedded SP
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    saml_form = None
+    for form in soup.find_all("form"):
+        if form.find("input", {"name": "SAMLResponse"}):
+            saml_form = form
+            break
+
+    if not saml_form:
+        raise IdPException("Invalid response from real IdP after authentication")
+
+    action = saml_form.get("action")
+
+    form_data = {}
+    for input_tag in saml_form.find_all("input"):
+        input_name = input_tag.attrs.get("name")
+        input_value = input_tag.attrs.get("value", "")
+        form_data[input_name] = input_value
+
+    if not action or not form_data:
+        raise SPException("Invalid response from real IdP after authentication")
+
+    try:
+        if debug:
+            print("Submitting IdP response back to embedded SP")
+
+        resp = sess.post(action, data=form_data, timeout=timeout)
+
+        if resp.status_code != 200:
+            debug and print_response_body(resp.text)
+            raise SPException("Failed to return to embedded SP after authentication - HTTP status {}".format(resp.status_code))
+    except requests.exceptions.RequestException as e:
+        raise SPException("Failed to return to embedded SP after authentication - {}".format(e))
+
+    debug and print_response_body(resp.text)
+
+    # Parse SAML response out of form
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    saml_form = None
+    for form in soup.find_all("form"):
+        if form.find("input", {"name": "SAMLResponse"}):
+            saml_form = form
+            break
+
+    if not saml_form:
+        raise IdPException("Invalid response from proxy IdP after authentication")
+
+    saml_resp = saml_form.find("input", {"name": "SAMLResponse"}).get("value")
+
+    if debug:
+        print("Base64-encoded SAML response")
+        print(saml_resp)
+        print()
+
+    # Base64 decode response
+    try:
+        decoded_resp = base64.b64decode(saml_resp).decode()
+
+    except binascii.Error:
+        raise IdPException("Unable to base64 decode response from proxy IdP")
+
+    if debug:
+        print("Base64-decoded SAML response")
+        print(decoded_resp)
+        print()
+
+    if "urn:oasis:names:tc:SAML:2.0:status:Success" not in decoded_resp:
+        raise IdPException("SAML success status not found in response from proxy IdP")
+    elif debug:
+        print("SAML success status found in response from proxy IdP")
+
+    if 'Name="{}"'.format(attribute) not in decoded_resp:
+        raise IdPException("Required attribute {} not found in response from proxy IdP".format(attribute))
+    elif debug:
+        print("Required attribute {} found in response from proxy IdP".format(attribute))
+
 def do_discovery_select(sess, resp, idp):
     """do_discovery_select() -- Select an IdP from a discovery service
 
@@ -238,6 +368,8 @@ def do_discovery_select(sess, resp, idp):
     Response object containing the result of IdP selection
     """
 
+    if not idp:
+        raise IdPException("Redirected to discovery page, but no default IdP was specified on the command-line")
     soup = BeautifulSoup(resp.text, "html.parser")
 
     disco_form = None
@@ -398,6 +530,10 @@ if __name__ == "__main__":
                           dest="attribute", action="store", default="eduPersonPrincipalName",
                           help="Friendly name of SAML attribute that must be in a successful response")
 
+    #-p / --proxy-idp
+    idp_opts.add_argument("-p", "--proxy-idp", dest="checking_proxy", default=False,
+                        action="store_true", help="Indicates that this IdP is a proxy IdP")
+
     #-u / --url
     sp_opts.add_argument("-u", "--url", metavar="URL", dest="url",
                          action="store",
@@ -405,7 +541,7 @@ if __name__ == "__main__":
 
     #-s / --output-string
     sp_opts.add_argument("-s", "--output-string", metavar="string",
-                         dest="outputStr", action="store",
+                         dest="output_str", action="store",
                          help="Text to expect on final page after successful authentication")
 
     #-i / --idp-selection
@@ -433,10 +569,13 @@ if __name__ == "__main__":
     if (options.host and options.url) or (not options.host and not options.url):
         parser.error("You must specify either an IdP hostname with -H or a service url with -u")
 
-    if options.url and not options.outputStr:
+    if options.url and not options.output_str:
         parser.error("When checking a service provider, you must specify a string to look for on the final page with -s")
 
-    if options.host and options.outputStr:
+    if options.url and options.checking_proxy:
+        parser.error("When checking a service provider, you cannot check a proxy IdP with -p")
+
+    if options.host and options.output_str:
         parser.error("Output string not valid when checking an IdP")
 
     if options.url and not (urlparse(options.url).scheme and urlparse(options.url).netloc):
@@ -444,18 +583,25 @@ if __name__ == "__main__":
 
     start_time = time.clock()
     try:
-        if options.host:
+        if options.host and not options.checking_proxy:
             if debug:
                 print("Doing IdP-initiated check")
 
             do_idp_initiated(options.host, options.entityid,
                              options.user, options.password, options.attribute)
+        elif options.host and options.checking_proxy:
+            if debug:
+                print("Doing IdP-initiated check against proxy IdP")
+
+            do_proxy_idp_initiated(options.host, options.entityid,
+                             options.user, options.password,
+                             options.attribute, options.idp)
         elif options.url:
             if debug:
                 print("Doing SP-initiated check")
 
             do_sp_initiated(options.url, options.user, options.password,
-                            options.outputStr, options.idp)
+                            options.output_str, options.idp)
     except (SPException, IdPException) as e:
         runtime = round((time.clock() - start_time) * 1000)
         print("IDP CRITICAL - {};|TIME={}\n".format(e, runtime))
