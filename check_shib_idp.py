@@ -427,8 +427,11 @@ def do_login(sess, resp, user, password):
     Response object containing the result of submitting the login form
     """
 
+    # Is Shibboleth proxying to ADFS?
+    proxy_to_adfs = False
+
     # IdP login form data to use for authentication
-    login_data = {'_eventId_proceed': 'Login', 'j_username': user, 'j_password': password}
+    login_data = {}
 
     # Get IdP hostname from response
     host = urlparse(resp.url).netloc
@@ -438,8 +441,15 @@ def do_login(sess, resp, user, password):
 
     login_form = None
     for form in soup.find_all("form"):
-        if form.find("input", {"name": "j_username"}):
+        if form.find("input", {"name": "UserName"}):
             login_form = form
+            proxy_to_adfs = True
+            login_data = {'UserName': user, 'Password': password, 'AuthMethod': 'FormsAuthentication'}
+            break
+
+        elif form.find("input", {"name": "j_username"}):
+            login_form = form
+            login_data = {'_eventId_proceed': 'Login', 'j_username': user, 'j_password': password}
             break
 
     if not login_form:
@@ -471,8 +481,65 @@ def do_login(sess, resp, user, password):
     soup = BeautifulSoup(resp.text, "html.parser")
 
     for form in soup.find_all("form"):
-        if form.find("input", {"name": "j_username"}):
+        if (proxy_to_adfs and form.find("input", {"name": "UserName"})) or (not proxy_to_adfs and form.find("input", {"name": "j_username"})):
             raise IdPException("IdP authentication failed")
+
+    if proxy_to_adfs:
+        # Get form to submit back to Shibboleth IdP
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        saml_form = None
+        for form in soup.find_all("form"):
+            if form.find("input", {"name": "SAMLResponse"}):
+                saml_form = form
+                break
+
+        if not saml_form:
+            raise IdPException("Invalid response from ADFS IdP after authentication")
+
+        saml_resp = saml_form.find("input", {"name": "SAMLResponse"}).get("value")
+
+        if debug:
+            print("Base64-encoded SAML response")
+            print(saml_resp)
+            print()
+
+        # Base64 decode response
+        try:
+            decoded_resp = base64.b64decode(saml_resp).decode()
+
+        except binascii.Error:
+            raise IdPException("Unable to base64 decode response from IdP")
+
+        if debug:
+            print("Base64-decoded SAML response")
+            print(decoded_resp)
+            print()
+
+        action = saml_form.get("action")
+
+        form_data = {}
+        for input_tag in saml_form.find_all("input"):
+            input_name = input_tag.attrs.get("name")
+            input_value = input_tag.attrs.get("value", "")
+            form_data[input_name] = input_value
+
+        if not action or not form_data:
+            raise IdPException("Invalid response from ADFS IdP after authentication")
+
+        try:
+            if debug:
+                print("Submitting IdP response back to Shibboleth IdP")
+
+            resp = sess.post(action, data=form_data, timeout=timeout)
+
+            if resp.status_code != 200:
+                debug and print_response_body(resp.text)
+                raise IdPException("Failed to return to Shibboleth IdP after authentication - HTTP status {}".format(resp.status_code))
+        except requests.exceptions.RequestException as e:
+            raise IdPException("Failed to return to Shibboleth IdP after authentication - {}".format(e))
+
+        debug and print_response_body(resp.text)
 
     return resp
 
@@ -581,7 +648,7 @@ if __name__ == "__main__":
     if options.url and not (urlparse(options.url).scheme and urlparse(options.url).netloc):
         parser.error("SP URL must be a valid URL")
 
-    start_time = time.clock()
+    start_time = time.perf_counter()
     try:
         if options.host and not options.checking_proxy:
             if debug:
@@ -603,11 +670,11 @@ if __name__ == "__main__":
             do_sp_initiated(options.url, options.user, options.password,
                             options.output_str, options.idp)
     except (SPException, IdPException) as e:
-        runtime = round((time.clock() - start_time) * 1000)
+        runtime = round((time.perf_counter() - start_time) * 1000)
         print("IDP CRITICAL - {};|TIME={}\n".format(e, runtime))
         sys.exit(2)
 
-    runtime = round((time.clock() - start_time) * 1000)
+    runtime = round((time.perf_counter() - start_time) * 1000)
 
     if options.crit and runtime > options.crit:
         print("IDP CRITICAL - TIME={} MS;|TIME={}\n".format(runtime, runtime))
