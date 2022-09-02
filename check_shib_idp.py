@@ -227,7 +227,7 @@ def do_proxy_idp_initiated(host, sp, user, password, attribute, idp):
     try:
         debug and print("Sending initial request to proxy IdP")
 
-        resp = sess.get(f"https://{host}/simplesaml/saml2/idp/SSOService",
+        resp = sess.get(f"https://{host}/simplesaml/saml2/idp/SSOService.php",
                         params=req_params, timeout=timeout)
         if resp.status_code != 200:
             debug and print_response_body(resp.text)
