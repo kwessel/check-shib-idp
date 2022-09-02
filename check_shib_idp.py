@@ -2,13 +2,15 @@
 
 """check_shib_idp.py -- Monitor a Shibboleth IdP or Shibboleth-protected service with Nagios
 
-(C) copyright 2021, University of Illinois Board of Trustees
+(C) copyright 2021-2022, University of Illinois Board of Trustees
 
 This Nagios plugin can check either an IdP directly using IdP-initiated
 SSO or a URL on an SP that's Shibboleth-protected using SP-initiated SSO.
 See check_shib_idp.py --help for syntax.
 
 Changelog:
+8/9/2022 -- kwessel: Support for Shibboleth proxying authentication to AzureAD
+1/10/2022 -- kwessel: Support for Shibboleth proxying authentication to ADFS
 4/8/2021 -- kwessel: Initial release
 """
 
@@ -16,10 +18,14 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 import argparse
 import requests
+from requests.exceptions import (RequestException,
+    JSONDecodeError as ReqJSONDecodeError)
 import base64
 import sys
 import binascii
 import time
+import re
+import json
 
 # For writing debug output
 from http.client import HTTPConnection
@@ -27,6 +33,11 @@ from http.client import HTTPConnection
 # Global vars
 debug = False
 timeout = 15
+azure_json_matcher = re.compile("\$Config=(?P<json>{[^;]+});")
+
+# Global constants
+AZURE_GET_CREDENTIAL_TYPE_URL = "https://login.microsoftonline.com/common/GetCredentialType"
+
 
 # Exceptions to throw
 class IdPException(Exception):
@@ -79,19 +90,19 @@ def do_idp_initiated(host, sp, user, password, attribute):
 
     # Send initial IdP-initiated SSO request
     try:
-        if debug:
-            print("Sending initial request to IdP")
-        resp = sess.get("https://{}/idp/profile/SAML2/Unsolicited/SSO".format(host),
+        debug and print("Sending initial request to IdP")
+
+        resp = sess.get(f"https://{host}/idp/profile/SAML2/Unsolicited/SSO",
                         params=req_params, timeout=timeout)
         if resp.status_code != 200:
             debug and print_response_body(resp.text)
-            raise IdPException("Not redirected to login page - HTTP status {}".format(resp.status_code))
-    except requests.exceptions.RequestException as e:
-        raise IdPException("Not redirected to login page - {}".format(e))
+            raise IdPException(f"Not redirected to login page - HTTP status {resp.status_code}")
+    except RequestException as e:
+        raise IdPException(f"Not redirected to login page - {e}")
 
     debug and print_response_body(resp.text)
 
-    resp = do_login(sess, resp, user, password)
+    resp = do_idp_login(sess, resp, user, password)
 
     # Parse SAML response out of form
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -129,10 +140,10 @@ def do_idp_initiated(host, sp, user, password, attribute):
     elif debug:
         print("SAML success status found in response")
 
-    if 'FriendlyName="{}"'.format(attribute) not in decoded_resp:
-        raise IdPException("Required attribute {} not found in response".format(attribute))
+    if f'FriendlyName="{attribute}"' not in decoded_resp:
+        raise IdPException(f"Required attribute {attribute} not found in response")
     elif debug:
-        print("Required attribute {} found in response".format(attribute))
+        print(f"Required attribute {atribute} found in response")
 
 def do_sp_initiated(url, user, password, string, idp):
     """do_sp_initiated() -- Check an SP resource that's Shibboleth-protected
@@ -157,14 +168,14 @@ def do_sp_initiated(url, user, password, string, idp):
 
     # Start at the specified URL
     try:
-        if debug:
-            print("Sending initial request to SP")
+        debug and print("Sending initial request to SP")
+
         resp = sess.get(url, timeout=timeout)
         if resp.status_code != 200:
             debug and print_response_body(resp.text)
-            raise SPException("Not redirected to login page - HTTP status {}".format(resp.status_code))
-    except requests.exceptions.RequestException as e:
-        raise SPException("Not redirected to login page - {}".format(e))
+            raise SPException(f"Not redirected to login page - HTTP status {resp.status_code}")
+    except RequestException as e:
+        raise SPException(f"Not redirected to login page - {e}")
 
     debug and print_response_body(resp.text)
 
@@ -173,50 +184,14 @@ def do_sp_initiated(url, user, password, string, idp):
 
     for form in soup.find_all("form"):
         if form.get("name") == "IdPList":
-            if debug:
-                print("IdP discovery page detected")
+            debug and print("IdP discovery page detected")
 
             resp = do_discovery_select(sess, resp, idp)
             break
 
-    resp = do_login(sess, resp, user, password)
+    resp = do_idp_login(sess, resp, user, password)
 
-    # Get form to submit back to SP
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    saml_form = None
-    for form in soup.find_all("form"):
-        if form.find("input", {"name": "SAMLResponse"}):
-            saml_form = form
-            break
-
-    if not saml_form:
-        raise IdPException("Invalid response from IdP after authentication")
-
-    action = saml_form.get("action")
-
-    form_data = {}
-    for input_tag in saml_form.find_all("input"):
-        input_name = input_tag.attrs.get("name")
-        input_value = input_tag.attrs.get("value", "")
-        form_data[input_name] = input_value
-
-    if not action or not form_data:
-        raise SPException("Invalid response from IdP after authentication")
-
-    try:
-        if debug:
-            print("Submitting IdP response back to SP")
-
-        resp = sess.post(action, data=form_data, timeout=timeout)
-
-        if resp.status_code != 200:
-            debug and print_response_body(resp.text)
-            raise SPException("Failed to return to SP after authentication - HTTP status {}".format(resp.status_code))
-    except requests.exceptions.RequestException as e:
-        raise SPException("Failed to return to SP after authentication - {}".format(e))
-
-    debug and print_response_body(resp.text)
+    resp = post_saml_response(sess, resp)
 
     if string not in resp.text:
         raise SPException("Expected output text not found after authentication")
@@ -250,15 +225,15 @@ def do_proxy_idp_initiated(host, sp, user, password, attribute, idp):
 
     # Send initial IdP-initiated SSO request
     try:
-        if debug:
-            print("Sending initial request to proxy IdP")
-        resp = sess.get("https://{}/simplesaml/saml2/idp/SSOService.php".format(host),
+        debug and print("Sending initial request to proxy IdP")
+
+        resp = sess.get(f"https://{host}/simplesaml/saml2/idp/SSOService.php",
                         params=req_params, timeout=timeout)
         if resp.status_code != 200:
             debug and print_response_body(resp.text)
-            raise IdPException("Not redirected to proxy IdP - HTTP status {}".format(resp.status_code))
-    except requests.exceptions.RequestException as e:
-        raise IdPException("Not redirected to proxy IdP - {}".format(e))
+            raise IdPException(f"Not redirected to proxy IdP - HTTP status {resp.status_code}")
+    except RequestException as e:
+        raise IdPException(f"Not redirected to proxy IdP - {e}")
 
     debug and print_response_body(resp.text)
 
@@ -267,13 +242,12 @@ def do_proxy_idp_initiated(host, sp, user, password, attribute, idp):
 
     for form in soup.find_all("form"):
         if form.get("name") == "IdPList":
-            if debug:
-                print("IdP discovery page detected")
+            debug and print("IdP discovery page detected")
 
             resp = do_discovery_select(sess, resp, idp)
             break
 
-    resp = do_login(sess, resp, user, password)
+    resp = do_idp_login(sess, resp, user, password)
 
     # Get form to submit back to embedded SP
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -299,16 +273,15 @@ def do_proxy_idp_initiated(host, sp, user, password, attribute, idp):
         raise SPException("Invalid response from real IdP after authentication")
 
     try:
-        if debug:
-            print("Submitting IdP response back to embedded SP")
+        debug and print("Submitting IdP response back to embedded SP")
 
         resp = sess.post(action, data=form_data, timeout=timeout)
 
         if resp.status_code != 200:
             debug and print_response_body(resp.text)
-            raise SPException("Failed to return to embedded SP after authentication - HTTP status {}".format(resp.status_code))
-    except requests.exceptions.RequestException as e:
-        raise SPException("Failed to return to embedded SP after authentication - {}".format(e))
+            raise SPException(f"Failed to return to embedded SP after authentication - HTTP status {resp.status_code}")
+    except RequestException as e:
+        raise SPException(f"Failed to return to embedded SP after authentication - {e}")
 
     debug and print_response_body(resp.text)
 
@@ -348,10 +321,10 @@ def do_proxy_idp_initiated(host, sp, user, password, attribute, idp):
     elif debug:
         print("SAML success status found in response from proxy IdP")
 
-    if 'Name="{}"'.format(attribute) not in decoded_resp:
-        raise IdPException("Required attribute {} not found in response from proxy IdP".format(attribute))
+    if f'Name="{attribute}"' not in decoded_resp:
+        raise IdPException(f"Required attribute {attribute} not found in response from proxy IdP")
     elif debug:
-        print("Required attribute {} found in response from proxy IdP".format(attribute))
+        print(f"Required attribute {attribute} found in response from proxy IdP")
 
 def do_discovery_select(sess, resp, idp):
     """do_discovery_select() -- Select an IdP from a discovery service
@@ -385,9 +358,9 @@ def do_discovery_select(sess, resp, idp):
     host = urlparse(resp.url).netloc
 
     # Get form response URL to submit back to discovery service
-    action = disco_form.get("action")
+    path = disco_form.get("action")
 
-    if not host or not action:
+    if not host or not path:
         raise SPException("Error from discovery service")
 
     # Build form response
@@ -398,21 +371,21 @@ def do_discovery_select(sess, resp, idp):
         if debug:
             print("Selecting IdP from discovery page")
 
-        resp = sess.post("https://{}{}".format(host, action), data=disco_data,
+        resp = sess.post(f"https://{host}{path}", data=disco_data,
                          timeout=timeout)
         if resp.status_code != 200:
             debug and print_response_body(resp.text)
 
-            raise SPException("Failed to return to SP after IdP selection - HTTP status {}".format(resp.status_code))
-    except requests.exceptions.RequestException as e:
-        raise SPException("Failed to return to SP after IdP selection - {}".format(e))
+            raise SPException(f"Failed to return to SP after IdP selection - HTTP status {resp.status_code}")
+    except RequestException as e:
+        raise SPException(f"Failed to return to SP after IdP selection - {e}")
 
     debug and print_response_body(resp.text)
 
     return resp
 
-def do_login(sess, resp, user, password):
-    """do_login() -- authenticate to an IdP
+def do_idp_login(sess, resp, user, password):
+    """do_idp_login() -- authenticate to an IdP
 
     Params:
     sess -- persistent request.session object
@@ -427,14 +400,12 @@ def do_login(sess, resp, user, password):
     Response object containing the result of submitting the login form
     """
 
-    # Is Shibboleth proxying to ADFS?
-    proxy_to_adfs = False
+    # Is Shibboleth proxying to ADFS, Azure, or not at all?
+    login_page = None
 
     # IdP login form data to use for authentication
     login_data = {}
-
-    # Get IdP hostname from response
-    host = urlparse(resp.url).netloc
+    json_config = {}
 
     # Make sure page contains a login form
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -442,104 +413,270 @@ def do_login(sess, resp, user, password):
     login_form = None
     for form in soup.find_all("form"):
         if form.find("input", {"name": "UserName"}):
+            debug and print("ADFS login page detected")
             login_form = form
-            proxy_to_adfs = True
+            login_page = "adfs"
             login_data = {'UserName': user, 'Password': password, 'AuthMethod': 'FormsAuthentication'}
             break
 
         elif form.find("input", {"name": "j_username"}):
+            debug and print("Shibboleth login page detected")
+            login_page = "shibboleth"
             login_form = form
             login_data = {'_eventId_proceed': 'Login', 'j_username': user, 'j_password': password}
             break
 
-    if not login_form:
+    # Found a login form, do the login
+    if login_page:
+        # Get IdP hostname from response
+        host = urlparse(resp.url).netloc
+
+        # Get form response URL
+        path = login_form.get("action")
+
+        if not host or not path:
+            raise IdPException("Error displaying IdP login page")
+
+        post_url = f"https://{host}{path}"
+        resp = do_authentication(sess, resp, post_url, login_data)
+
+    # No form, let's see if this is Azure
+    else:
+        json_config = {}
+
+        for script in soup.find_all("script"):
+            code = azure_json_matcher.search(str(script.string))
+
+            if code:
+                try:
+                    json_config = json.loads(code.group("json"))
+                except JSONDecodeError as e:
+                    raise IdPException(f"Azure login page JSON parsing error: {e}")
+
+                debug and print("AzureAD login page detected")
+                login_page = "azure"
+                resp = do_azure_authentication(sess, resp, user, password, json_config)
+                break
+
+    if not login_page:
         raise IdPException("Error displaying IdP login page")
 
-    # Get form response URL
-    action = login_form.get("action")
+    # If Azure or ADFS, we need to post the response back to Shibboleth
+    if login_page != "shibboleth":
+        resp = post_saml_response(sess, resp)
 
-    if not host or not action:
-        raise IdPException("Error displaying IdP login page")
+    return resp
+
+def post_saml_response(sess, resp):
+    """post_saml_response() -- Parse out and post a SAML response
+
+    Params:
+    sess -- persistent request.session object
+    resp -- request response object containing the discovery service form
+
+    Throws:
+    IdPException if SAML response can't be parsed
+    SPException if response fails to post
+
+    Returns:
+    Response object containing the result of submitting the login form
+    """
+
+    # Parse form containing SAML response
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    saml_form = None
+    for form in soup.find_all("form"):
+        if form.find("input", {"name": "SAMLResponse"}):
+            saml_form = form
+            break
+
+    if not saml_form:
+        raise IdPException("Invalid response from IdP after authentication")
+
+    saml_resp = saml_form.find("input", {"name": "SAMLResponse"}).get("value")
+
+    if debug:
+        print("Base64-encoded SAML response")
+        print(saml_resp)
+        print()
+
+    # Base64 decode response
+    try:
+        decoded_resp = base64.b64decode(saml_resp).decode()
+
+    except binascii.Error:
+        raise IdPException("Unable to base64 decode response from IdP")
+
+    if debug:
+        print("Base64-decoded SAML response")
+        print(decoded_resp)
+        print()
+
+    action = saml_form.get("action")
+
+    form_data = {}
+    for input_tag in saml_form.find_all("input"):
+        input_name = input_tag.attrs.get("name")
+        input_value = input_tag.attrs.get("value", "")
+        form_data[input_name] = input_value
+
+    if not action or not form_data:
+        raise IdPException("Invalid response from IdP after authentication")
+
+    try:
+        debug and print("Submitting IdP SAML response")
+
+        resp = sess.post(action, data=form_data, timeout=timeout)
+
+        if resp.status_code != 200:
+            debug and print_response_body(resp.text)
+            raise SPException(f"Failed to post SAML response after authentication - HTTP status {resp.status_code}")
+    except RequestException as e:
+        raise SPException(f"Failed to post SAML response after authentication - {e}")
+
+    debug and print_response_body(resp.text)
+
+    return resp
+
+def do_authentication(sess, resp, post_url, login_data):
+    """do_authentication() -- authenticate to Shibboleth or ADFS
+
+    Params:
+    sess -- persistent request.session object
+    resp -- request response object containing the discovery service form
+    post_url -- URL to post login form to
+    login_data -- form data to post to login form
+
+    Throws:
+    IdPException if interaction fails at any point
+
+    Returns:
+    Response object containing the result of submitting the login form
+    """
 
     # Fill out and submit form -- log in
     try:
-        if debug:
-            print("Submitting IdP login form")
+        debug and print("Submitting IdP login form")
 
-        resp = sess.post("https://{}{}".format(host, action), data=login_data,
+        resp = sess.post(post_url, data=login_data,
                          timeout=timeout)
 
         if resp.status_code != 200:
             debug and print_response_body(resp.text)
-            raise IdPException("Failed to submit login page to IdP - HTTP status {}".format(resp.status_code))
-    except requests.exceptions.RequestException as e:
-        raise IdPException("Failed to submit login page to IdP - {}".format(e))
+            raise IdPException(f"Failed to submit login page to IdP - HTTP status {resp.status_code}")
+    except RequestException as e:
+        raise IdPException(f"Failed to submit login page to IdP - {e}")
 
     debug and print_response_body(resp.text)
 
-    # Make sure we didn't get the login form again
+    # Make sure we didn't get the login form back again
     soup = BeautifulSoup(resp.text, "html.parser")
 
     for form in soup.find_all("form"):
-        if (proxy_to_adfs and form.find("input", {"name": "UserName"})) or (not proxy_to_adfs and form.find("input", {"name": "j_username"})):
+        if form.find("input", {"name": "UserName"}) or form.find("input", {"name": "j_username"}):
             raise IdPException("IdP authentication failed")
 
-    if proxy_to_adfs:
-        # Get form to submit back to Shibboleth IdP
-        soup = BeautifulSoup(resp.text, "html.parser")
+    return resp
 
-        saml_form = None
-        for form in soup.find_all("form"):
-            if form.find("input", {"name": "SAMLResponse"}):
-                saml_form = form
-                break
+def do_azure_authentication(sess, resp, user, password, json_config):
+    """do_azure_authentication() -- authenticate to Microsoft AzureAD
 
-        if not saml_form:
-            raise IdPException("Invalid response from ADFS IdP after authentication")
+    Params:
+    sess -- persistent request.session object
+    resp -- request response object containing the discovery service form
+    user -- username to use in authentication
+    password -- password to use in authentication
+    json_config -- dict containing Azure $Config JSON block from input resp
 
-        saml_resp = saml_form.find("input", {"name": "SAMLResponse"}).get("value")
+    Throws:
+    IdPException if interaction fails at any point
 
-        if debug:
-            print("Base64-encoded SAML response")
-            print(saml_resp)
-            print()
+    Returns:
+    Response object containing the result of submitting the login form
+    """
 
-        # Base64 decode response
+    # Build headers and post to send to GetCredentialType endpoint
+    try:
+        azure_headers = {"canary": str(json_config["canary"]),
+            "client-request-id": str(json_config["correlationId"]),
+            "hpgact": str(json_config["hpgact"]),
+            "hpgid": str(json_config["hpgid"]),
+            "hpgrequestid": str(json_config["sessionId"])
+            }
+
+        azure_post = {"flowToken": str(json_config["sFT"]),
+            "originalRequest": str(json_config["sCtx"]),
+            "username": user
+            }
+    except KeyError as e:
+        raise IdPException(f"Key {e} not found in Azure login config JSON")
+
+    try:
+        action = f'{resp.url[:resp.url.index("/saml")]}/login'
+    except ValueError:
+        raise IdPException("Looks like an Azure SSO proxy, but can't parse URL to submit form: /saml not found in URL")
+
+    try:
+        debug and print("Found Azure login page, hitting GetCredentialType endpoint")
+
+        # Post username to GetCredentialType endpoint first
+        resp = sess.post(AZURE_GET_CREDENTIAL_TYPE_URL,
+                    params={"mkt": "en-US"},
+                    headers=azure_headers, json=azure_post,
+                    timeout=timeout)
+
+        if resp.status_code != 200:
+            debug and print_response_body(resp.text)
+            raise IdPException(f"Error from Azure GetCredentialType endpoint - HTTP status {resp.status_code}")
+
+        json_cred_type = resp.json()
+    except (RequestException, ReqJSONDecodeError, KeyError) as e:
+        raise IdPException(f"Error from Azure GetCredentialType endpoint - {e}")
+
+    debug and print_response_body(resp.text)
+
+    if debug:
+        # Sanity check to make sure FlowToken hasn't changed
         try:
-            decoded_resp = base64.b64decode(saml_resp).decode()
+            if json_config["sFT"] != json_cred_type["FlowToken"]:
+                print("sFT differes between SAML request and get cred type")
 
-        except binascii.Error:
-            raise IdPException("Unable to base64 decode response from IdP")
+        except KeyError as e:
+            print(f"Key {e} not found in get cred type response")
 
-        if debug:
-            print("Base64-decoded SAML response")
-            print(decoded_resp)
-            print()
+    # Build the post to perform second part of authentication
+    azure_login_post = {"canary": str(json_config["canary"]),
+        "ctx": str(json_config["sCtx"]),
+        "flowToken": str(json_config["sFT"]),
+        "hpgrequestid": str(json_config["sessionId"]),
+        "login": user,
+        "loginfmt": user,
+        "passwd": password
+        }
 
-        action = saml_form.get("action")
+    # Fill out and submit form -- log in
+    try:
+        debug and print("Submitting IdP login form")
 
-        form_data = {}
-        for input_tag in saml_form.find_all("input"):
-            input_name = input_tag.attrs.get("name")
-            input_value = input_tag.attrs.get("value", "")
-            form_data[input_name] = input_value
+        resp = sess.post(action, data=azure_login_post,
+                     timeout=timeout)
 
-        if not action or not form_data:
-            raise IdPException("Invalid response from ADFS IdP after authentication")
+        if resp.status_code != 200:
+            debug and print_response_body(resp.text)
+            raise IdPException(f"Failed to submit login page to Azure IdP - HTTP status {resp.status_code}")
+    except RequestException as e:
+        raise IdPException(f"Failed to submit login page to Azure IdP - {e}")
 
-        try:
-            if debug:
-                print("Submitting IdP response back to Shibboleth IdP")
+    debug and print_response_body(resp.text)
 
-            resp = sess.post(action, data=form_data, timeout=timeout)
+    # Make sure we didn't get the login form back again
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-            if resp.status_code != 200:
-                debug and print_response_body(resp.text)
-                raise IdPException("Failed to return to Shibboleth IdP after authentication - HTTP status {}".format(resp.status_code))
-        except requests.exceptions.RequestException as e:
-            raise IdPException("Failed to return to Shibboleth IdP after authentication - {}".format(e))
-
-        debug and print_response_body(resp.text)
+    for script in soup.find_all("script"):
+        code = azure_json_matcher.search(str(script.string))
+        if code:
+            raise IdPException("IdP authentication failed")
 
     return resp
 
@@ -671,17 +808,17 @@ if __name__ == "__main__":
                             options.output_str, options.idp)
     except (SPException, IdPException) as e:
         runtime = round((time.perf_counter() - start_time) * 1000)
-        print("IDP CRITICAL - {};|TIME={}\n".format(e, runtime))
+        print(f"IDP CRITICAL - {e};|TIME={runtime}\n")
         sys.exit(2)
 
     runtime = round((time.perf_counter() - start_time) * 1000)
 
     if options.crit and runtime > options.crit:
-        print("IDP CRITICAL - TIME={} MS;|TIME={}\n".format(runtime, runtime))
+        print(f"IDP CRITICAL - TIME={runtime} MS;|TIME={runtime}\n")
         sys.exit(2)
     elif options.warn and runtime > options.warn:
-        print("IDP WARN - TIME={} MS;|TIME={}\n".format(runtime, runtime))
+        print(f"IDP WARN - TIME={runtime} MS;|TIME={runtime}\n")
         sys.exit(1)
     else:
-        print("IDP OK - TIME={} MS;|TIME={}\n".format(runtime, runtime))
+        print(f"IDP OK - TIME={runtime} MS;|TIME={runtime}\n")
         sys.exit(0)
