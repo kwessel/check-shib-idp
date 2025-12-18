@@ -33,7 +33,7 @@ from http.client import HTTPConnection
 # Global vars
 debug = False
 timeout = 15
-azure_json_matcher = re.compile("\$Config=(?P<json>{[^;]+});")
+azure_json_matcher = re.compile(r"\$Config=(?P<json>\{.+\});")
 
 # Global constants
 AZURE_GET_CREDENTIAL_TYPE_URL = "https://login.microsoftonline.com/common/GetCredentialType"
